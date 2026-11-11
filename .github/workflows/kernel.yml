@@ -1,0 +1,85 @@
+name: Kernel KSU Next
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: defconfig
+        default: vayu_defconfig
+env:
+  DEFCONFIG: ${{ inputs.defconfig }}
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dependencias
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison flex libssl-dev libelf-dev zip lz4 cpio
+      - name: Baixar fontes
+        run: |
+          git clone --depth=1 -b s-caf https://github.com/Pierre2324/NGK_android_kernel_xiaomi_sm8150 kernel
+          git clone --depth=1 https://github.com/kdrag0n/proton-clang clang
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 ak3
+      - name: Trocar KernelSU oficial pelo Next
+        working-directory: kernel
+        run: |
+          head -50 compile.sh || true
+          if grep -q ksu_ fs/exec.c; then HOOKS=manual; else HOOKS=kprobe; fi
+          echo "HOOKS=$HOOKS" | tee -a $GITHUB_ENV
+          git submodule deinit -f --all || true
+          git rm -rf --cached KernelSU || true
+          rm -rf KernelSU drivers/kernelsu .git/modules/KernelSU .gitmodules
+          sed -i '/kernelsu/Id' drivers/Makefile drivers/Kconfig
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s legacy
+          ls -la drivers/kernelsu
+      - name: Compilar
+        shell: bash
+        working-directory: kernel
+        run: |
+          test -f arch/arm64/configs/$DEFCONFIG || { echo "defconfig nao existe. Parecidos:"; ls arch/arm64/configs | grep -iE "vayu|bhima|sm8150|xiaomi"; exit 1; }
+          echo "CONFIG_KSU=y" >> arch/arm64/configs/$DEFCONFIG
+          if [ "$HOOKS" = kprobe ]; then
+            printf "CONFIG_KPROBES=y\nCONFIG_KPROBE_EVENTS=y\nCONFIG_KSU_KPROBE_HOOKS=y\n" >> arch/arm64/configs/$DEFCONFIG
+          else
+            echo "# CONFIG_KSU_KPROBE_HOOKS is not set" >> arch/arm64/configs/$DEFCONFIG
+          fi
+          export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH ARCH=arm64 SUBARCH=arm64
+          M="make -j$(nproc) O=out CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          $M $DEFCONFIG
+          grep -E "CONFIG_KSU|CONFIG_KPROBES" out/.config
+          $M 2>&1 | tail -n 150
+          ls out/arch/arm64/boot
+      - name: Empacotar
+        run: |
+          IMG=kernel/out/arch/arm64/boot/Image.gz-dtb
+          test -f $IMG || { echo "Image.gz-dtb nao gerada"; ls kernel/out/arch/arm64/boot; exit 1; }
+          cd ak3
+          rm -rf .git .github *.md
+          cp ../$IMG .
+          cat > anykernel.sh <<'EOF'
+          properties() { '
+          kernel.string=NGK + KernelSU Next
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=0
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=vayu
+          device.name2=bhima
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; }
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=auto;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+          . tools/ak3-core.sh;
+          split_boot;
+          flash_boot;
+          EOF
+          zip -r9 ../NGK-KSUNext-vayu.zip * -x ".git*"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernel-zip
+          path: NGK-KSUNext-vayu.zip
